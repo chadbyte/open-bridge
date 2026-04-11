@@ -1,5 +1,5 @@
 {
-  "name": "yoker",
+  "name": "yokedev",
   "version": "0.0.0-semantically-released",
   "description": "YOKE (Yoke Overrides Known Engines). Vendor-independent runtime abstraction for AI coding agents.",
   "main": "index.js",
