@@ -1,0 +1,49 @@
+{
+  "name": "yoker",
+  "version": "0.0.0-semantically-released",
+  "description": "YOKE (Yoke Overrides Known Engines). Vendor-independent runtime abstraction for AI coding agents.",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "interface.js",
+    "adapters/"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "runtime",
+    "abstraction",
+    "adapter",
+    "claude",
+    "opencode",
+    "codex",
+    "yoke"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chadbyte/yoker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chadbyte/yoker/issues"
+  },
+  "homepage": "https://github.com/chadbyte/yoker#readme",
+  "author": "Chad Lee",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "semantic-release": "^24.0.0"
+  },
+  "release": {
+    "branches": ["main"],
+    "plugins": [
+      ["@semantic-release/commit-analyzer", {
+        "preset": "angular"
+      }],
+      "@semantic-release/release-notes-generator",
+      "@semantic-release/npm",
+      "@semantic-release/github"
+    ]
+  }
+}
