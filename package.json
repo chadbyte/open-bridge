@@ -1,6 +1,6 @@
 {
   "name": "boxbox",
-  "version": "0.0.0-semantically-released",
+  "version": "0.1.0",
   "description": "YOKE (Yoke Overrides Known Engines). Vendor-independent runtime abstraction for AI coding agents.",
   "main": "index.js",
   "files": [
