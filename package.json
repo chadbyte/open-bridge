@@ -21,12 +21,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/chadbyte/yoker.git"
+    "url": "https://github.com/chadbyte/open-agent.git"
   },
   "bugs": {
-    "url": "https://github.com/chadbyte/yoker/issues"
+    "url": "https://github.com/chadbyte/open-agent/issues"
   },
-  "homepage": "https://github.com/chadbyte/yoker#readme",
+  "homepage": "https://github.com/chadbyte/open-agent#readme",
   "author": "Chad Lee",
   "license": "MIT",
   "engines": {
