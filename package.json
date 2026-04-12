@@ -1,7 +1,7 @@
 {
-  "name": "open-agent",
+  "name": "open-bridge",
   "version": "0.1.0",
-  "description": "YOKE (Yoke Overrides Known Engines). Vendor-independent runtime abstraction for AI coding agents.",
+  "description": "Open Bridge. Vendor-independent runtime abstraction for AI coding agents.",
   "main": "index.js",
   "files": [
     "index.js",
@@ -14,19 +14,19 @@
     "runtime",
     "abstraction",
     "adapter",
+    "bridge",
     "claude",
     "opencode",
-    "codex",
-    "yoke"
+    "codex"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/chadbyte/open-agent.git"
+    "url": "https://github.com/chadbyte/open-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/chadbyte/open-agent/issues"
+    "url": "https://github.com/chadbyte/open-bridge/issues"
   },
-  "homepage": "https://github.com/chadbyte/open-agent#readme",
+  "homepage": "https://github.com/chadbyte/open-bridge#readme",
   "author": "Chad Lee",
   "license": "MIT",
   "engines": {
