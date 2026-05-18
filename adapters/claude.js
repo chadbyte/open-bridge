@@ -10,7 +10,16 @@ var os = require("os");
 var net = require("net");
 var crypto = require("crypto");
 var { spawn } = require("child_process");
-var { resolveOsUserInfo } = require("../../os-users");
+/* `../../os-users` is a clay-internal helper for Linux user isolation.
+ * Standalone (open-bridge) consumers don't ship it; fall back to a
+ * no-op resolver that returns null so the adapter still runs as the
+ * current process owner. */
+var resolveOsUserInfo;
+try {
+  resolveOsUserInfo = require("../../os-users").resolveOsUserInfo;
+} catch (e) {
+  resolveOsUserInfo = function () { return null; };
+}
 
 // --- SDK loading ---
 // Async loader (ESM dynamic import, same pattern as current project.js getSDK)
@@ -506,7 +515,13 @@ function spawnWorker(linuxUser, workerScriptPath, cwd) {
 
     // Spawn worker process as the target Linux user.
     // Build a minimal, isolated env (no daemon env leakage).
-    var workerEnv = require("../../build-user-env").buildUserEnv({
+    // `../../build-user-env` is clay-internal — open-bridge consumers
+    // that don't ship it never reach this branch (resolveOsUserInfo is
+    // a no-op fallback returning null), but we still try-load defensively.
+    var buildUserEnv;
+    try { buildUserEnv = require("../../build-user-env").buildUserEnv; }
+    catch (e) { throw new Error("Linux-user worker spawn requires clay's build-user-env helper."); }
+    var workerEnv = buildUserEnv({
       uid: userInfo.uid,
       gid: userInfo.gid,
       home: userInfo.home,
@@ -600,7 +615,7 @@ function spawnWorker(linuxUser, workerScriptPath, cwd) {
   worker.send = function(msg) {
     if (!worker.connection || worker.connection.destroyed) return;
     try {
-      worker.connection.write(JSON.stringify(msg) + "\n");
+      worker.connection.write(JSON.stringify(serializeWorkerValue(msg)) + "\n");
     } catch (e) {
       console.error("[yoke/claude] Failed to send to worker:", e.message);
     }
@@ -643,17 +658,55 @@ function cleanupWorker(worker) {
   worker.ready = false;
 }
 
+function serializeWorkerValue(value, seen) {
+  if (value == null) return value;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value === "function" || typeof value === "symbol" || typeof value === "undefined") return undefined;
+  if (value instanceof Date) return value.toISOString();
+  if (Buffer.isBuffer(value)) return value.toString("base64");
+
+  if (!seen) seen = new WeakSet();
+  if (typeof value === "object") {
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+  }
+
+  if (Array.isArray(value)) {
+    var arr = [];
+    for (var i = 0; i < value.length; i++) {
+      var item = serializeWorkerValue(value[i], seen);
+      if (item !== undefined) arr.push(item);
+    }
+    return arr;
+  }
+
+  var out = {};
+  var keys = Object.keys(value);
+  for (var j = 0; j < keys.length; j++) {
+    var key = keys[j];
+    var child = serializeWorkerValue(value[key], seen);
+    if (child !== undefined) out[key] = child;
+  }
+  return out;
+}
+
 // --- Worker QueryHandle ---
 // Wraps worker IPC into the same async iterable + control interface as the
 // in-process QueryHandle. This allows processQueryStream to iterate a worker
 // query identically to an in-process query.
 
-function createWorkerQueryHandle(worker, canUseTool, onElicitation) {
+function createWorkerQueryHandle(worker, canUseTool, onElicitation, callMcpTool) {
   // Async iterable state
   var iterQueue = [];
   var iterWaiting = null;
   var iterEnded = false;
   var iterError = null;
+
+  // Pending request/response correlation for handle methods that need a
+  // result from the worker (e.g. rewindFiles). Each entry is keyed by a
+  // requestId and holds { resolve, reject } of the in-flight Promise.
+  var pendingRewinds = {};
 
   function pushToIter(value) {
     if (iterEnded) return;
@@ -741,6 +794,20 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation) {
         }
         break;
 
+      case "mcp_tool_call":
+        if (callMcpTool) {
+          callMcpTool(msg.serverName, msg.toolName, msg.args || {}).then(function(result) {
+            worker.send({ type: "mcp_tool_result", requestId: msg.requestId, result: result });
+          }).catch(function(e) {
+            worker.send({
+              type: "mcp_tool_result",
+              requestId: msg.requestId,
+              error: (e && e.message) ? e.message : String(e),
+            });
+          });
+        }
+        break;
+
       case "context_usage":
       case "model_changed":
       case "effort_changed":
@@ -749,6 +816,16 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation) {
         // Yield these as _worker_meta events so processQueryStream can handle them
         pushToIter({ type: "_worker_meta", subtype: msg.type, data: msg });
         break;
+
+      case "rewind_files_response": {
+        var rp = pendingRewinds[msg.requestId];
+        if (rp) {
+          delete pendingRewinds[msg.requestId];
+          if (msg.error) rp.reject(new Error(msg.error));
+          else rp.resolve(msg.result);
+        }
+        break;
+      }
 
       case "query_done":
         console.log("[yoke/claude] IPC query_done received, pid=" + (worker.process ? worker.process.pid : "?"));
@@ -887,6 +964,22 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation) {
     endInput: function() {
       worker.send({ type: "end_messages" });
     },
+
+    // Claude SDK specific: rewind files to a previous state. The in-process
+    // handle calls rawQuery.rewindFiles directly; the worker variant has to
+    // hop through IPC and correlate the response by requestId.
+    rewindFiles: function(uuid, opts) {
+      var requestId = crypto.randomUUID();
+      return new Promise(function(resolve, reject) {
+        pendingRewinds[requestId] = { resolve: resolve, reject: reject };
+        try {
+          worker.send({ type: "rewind_files", requestId: requestId, uuid: uuid, opts: opts || {} });
+        } catch (e) {
+          delete pendingRewinds[requestId];
+          reject(e);
+        }
+      });
+    },
   };
 
   return handle;
@@ -895,9 +988,48 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation) {
 
 // --- Adapter factory ---
 
+function resolveClaudeBinaryPath() {
+  // 1. Explicit env var override
+  if (process.env.CLAUDE_CODE_PATH && fs.existsSync(process.env.CLAUDE_CODE_PATH)) {
+    return process.env.CLAUDE_CODE_PATH;
+  }
+
+  // 2. `which claude` in the daemon's PATH
+  try {
+    var result = require("child_process").execSync("which claude", { encoding: "utf8", timeout: 5000 }).trim();
+    if (result && fs.existsSync(result)) return result;
+  } catch (e) {}
+
+  // 3. Common per-user and system locations (best-effort fallback for the daemon user)
+  var home = process.env.HOME || "";
+  var candidates = [];
+  if (home) {
+    candidates.push(home + "/.npm-global/bin/claude");
+    candidates.push(home + "/.local/bin/claude");
+    candidates.push(home + "/.volta/bin/claude");
+    candidates.push(home + "/.bun/bin/claude");
+    candidates.push(home + "/bin/claude");
+  }
+  candidates.push("/usr/local/bin/claude");
+  candidates.push("/usr/bin/claude");
+  candidates.push("/opt/homebrew/bin/claude");
+  for (var i = 0; i < candidates.length; i++) {
+    try { if (fs.existsSync(candidates[i])) return candidates[i]; } catch (e) {}
+  }
+
+  // 4. Bundled CLI entry from the SDK's peer
+  try {
+    var resolved = require.resolve("@anthropic-ai/claude-code/cli.js");
+    if (resolved && fs.existsSync(resolved)) return resolved;
+  } catch (e) {}
+
+  return null;
+}
+
 function createClaudeAdapter(opts) {
   var _cwd = (opts && opts.cwd) || process.cwd();
   var _cachedModels = [];
+  var _claudeBinaryPath = resolveClaudeBinaryPath();
 
   // Path to the worker script (for OS-level user isolation)
   var workerScriptPath = path.join(__dirname, "claude-worker.js");
@@ -934,7 +1066,9 @@ function createClaudeAdapter(opts) {
         cwd: (initOpts && initOpts.cwd) || _cwd,
         settingSources: ["user", "project", "local"],
         abortController: ac,
+        settings: { disableAllHooks: true },
       };
+      if (_claudeBinaryPath) warmupOptions.pathToClaudeCodeExecutable = _claudeBinaryPath;
 
       if (initOpts && initOpts.dangerouslySkipPermissions) {
         warmupOptions.permissionMode = "bypassPermissions";
@@ -1069,6 +1203,7 @@ function createClaudeAdapter(opts) {
         cwd: queryOpts.cwd || _cwd,
         abortController: ac,
       };
+      if (_claudeBinaryPath) sdkOptions.pathToClaudeCodeExecutable = _claudeBinaryPath;
 
       // YOKE standard options -> SDK options
       if (queryOpts.systemPrompt) sdkOptions.systemPrompt = queryOpts.systemPrompt;
@@ -1080,7 +1215,13 @@ function createClaudeAdapter(opts) {
       if (queryOpts.resumeSessionId) sdkOptions.resume = queryOpts.resumeSessionId;
 
       // Claude-specific options from adapterOptions.CLAUDE
-      if (co.settingSources) sdkOptions.settingSources = co.settingSources;
+      // Always set settingSources explicitly. SDK 0.2.119+ defaults to
+      // loading ALL sources when omitted, but Clay relies on the caller
+      // declaring its scope (e.g. auto-title and mention sub-queries pass
+      // ["user"] only). Falling through to the SDK default would silently
+      // include project/local settings in those isolated paths.
+      sdkOptions.settingSources = co.settingSources || ["user", "project", "local"];
+      if (queryOpts.title) sdkOptions.title = queryOpts.title;
       if (co.includePartialMessages != null) sdkOptions.includePartialMessages = co.includePartialMessages;
       if (co.enableFileCheckpointing != null) sdkOptions.enableFileCheckpointing = co.enableFileCheckpointing;
       if (co.extraArgs) sdkOptions.extraArgs = co.extraArgs;
@@ -1091,9 +1232,62 @@ function createClaudeAdapter(opts) {
       if (co.permissionMode) sdkOptions.permissionMode = co.permissionMode;
       if (co.allowDangerouslySkipPermissions) sdkOptions.allowDangerouslySkipPermissions = true;
       if (co.resumeSessionAt) sdkOptions.resumeSessionAt = co.resumeSessionAt;
+      if (co.settings) sdkOptions.settings = co.settings;
 
       var rawQuery = sdk.query({ prompt: mq, options: sdkOptions });
       return createQueryHandle(rawQuery, mq, ac);
+    },
+
+    // --- Title generation ---
+    generateTitle: async function(messages, opts) {
+      console.log("[auto-title/claude] generateTitle called with " + messages.length + " messages");
+      var systemPrompt = "You are a title generator. Output only a short title (3-8 words). No quotes, no punctuation at the end, no explanation.";
+      var prompt = "Below is a conversation between a user and an AI assistant. Generate a short, descriptive title (3-8 words) that captures the main topic. Reply with ONLY the title, nothing else.\n\n";
+      for (var i = 0; i < messages.length; i++) {
+        prompt += "User message " + (i + 1) + ": " + messages[i] + "\n";
+      }
+      var ac = new AbortController();
+      console.log("[auto-title/claude] Creating query with model=haiku...");
+      var handle = await adapter.createQuery({
+        cwd: (opts && opts.cwd) || _cwd,
+        systemPrompt: systemPrompt,
+        model: "haiku",
+        adapterOptions: {
+          CLAUDE: {
+            settingSources: ["user"],
+            permissionMode: "bypassPermissions",
+          }
+        },
+        abortController: ac,
+      });
+      console.log("[auto-title/claude] Query created, pushing message...");
+      handle.pushMessage(prompt);
+      var title = "";
+      var streamed = false;
+      try {
+        for await (var msg of handle) {
+          if (msg.yokeType === "text_delta" && msg.text) {
+            streamed = true;
+            title += msg.text;
+          } else if (msg.yokeType === "message" && msg.messageRole === "assistant" && !streamed && msg.content) {
+            // Fallback: extract text from non-streamed message content
+            var content = msg.content;
+            if (Array.isArray(content)) {
+              for (var ci = 0; ci < content.length; ci++) {
+                if (content[ci].type === "text" && content[ci].text) {
+                  title += content[ci].text;
+                }
+              }
+            }
+          } else if (msg.yokeType === "result") {
+            break;
+          }
+        }
+      } finally {
+        handle.close();
+      }
+      console.log("[auto-title/claude] Generated: " + title.substring(0, 80));
+      return title.replace(/[\r\n]+/g, " ").replace(/^["'\s]+|["'\s.]+$/g, "").trim();
     },
 
     // --- Session management ---
@@ -1166,7 +1360,7 @@ function createClaudeAdapter(opts) {
     }
 
     // Create the worker query handle (sets up message handler on worker)
-    var handle = createWorkerQueryHandle(worker, queryOpts.canUseTool, queryOpts.onElicitation);
+    var handle = createWorkerQueryHandle(worker, queryOpts.canUseTool, queryOpts.onElicitation, queryOpts.callMcpTool);
 
     // Wait for worker to be ready before sending query_start
     if (!reusingWorker) {
@@ -1177,7 +1371,10 @@ function createClaudeAdapter(opts) {
     var queryOptions = {
       cwd: workerCwd,
     };
-    if (claudeOpts.settingSources) queryOptions.settingSources = claudeOpts.settingSources;
+    // Always set settingSources explicitly. See in-process path comment
+    // above for the SDK 0.2.119+ default-change rationale.
+    queryOptions.settingSources = claudeOpts.settingSources || ["user", "project", "local"];
+    if (queryOpts.title) queryOptions.title = queryOpts.title;
     if (claudeOpts.includePartialMessages != null) queryOptions.includePartialMessages = claudeOpts.includePartialMessages;
     if (claudeOpts.enableFileCheckpointing != null) queryOptions.enableFileCheckpointing = claudeOpts.enableFileCheckpointing;
     if (claudeOpts.extraArgs) queryOptions.extraArgs = claudeOpts.extraArgs;
@@ -1187,8 +1384,9 @@ function createClaudeAdapter(opts) {
     if (claudeOpts.betas && claudeOpts.betas.length > 0) queryOptions.betas = claudeOpts.betas;
     if (claudeOpts.permissionMode) queryOptions.permissionMode = claudeOpts.permissionMode;
     if (claudeOpts.allowDangerouslySkipPermissions) queryOptions.allowDangerouslySkipPermissions = true;
+    if (claudeOpts.settings) queryOptions.settings = claudeOpts.settings;
 
-    if (queryOpts.toolServers) queryOptions.mcpServers = queryOpts.toolServers;
+    if (queryOpts.toolServerDescriptors) queryOptions.mcpServerDescriptors = queryOpts.toolServerDescriptors;
     if (queryOpts.model) queryOptions.model = queryOpts.model;
     if (queryOpts.effort) queryOptions.effort = queryOpts.effort;
     if (queryOpts.resumeSessionId) queryOptions.resume = queryOpts.resumeSessionId;
@@ -1293,7 +1491,9 @@ function createClaudeAdapter(opts) {
         cwd: (initOpts && initOpts.cwd) || _cwd,
         settingSources: ["user", "project", "local"],
         abortController: ac,
+        settings: { disableAllHooks: true },
       };
+      if (_claudeBinaryPath) warmupOptions.pathToClaudeCodeExecutable = _claudeBinaryPath;
 
       if (initOpts && initOpts.dangerouslySkipPermissions) {
         warmupOptions.permissionMode = "bypassPermissions";
@@ -1366,7 +1566,8 @@ function createClaudeAdapter(opts) {
       throw new Error("Warmup worker failed to connect: " + (e.message || e));
     }
 
-    var warmupOptions = { cwd: workerCwd, settingSources: ["user", "project", "local"] };
+    var warmupOptions = { cwd: workerCwd, settingSources: ["user", "project", "local"], settings: { disableAllHooks: true } };
+    if (_claudeBinaryPath) warmupOptions.pathToClaudeCodeExecutable = _claudeBinaryPath;
     if (initOpts && initOpts.dangerouslySkipPermissions) {
       warmupOptions.permissionMode = "bypassPermissions";
       warmupOptions.allowDangerouslySkipPermissions = true;

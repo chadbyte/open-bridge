@@ -16,11 +16,79 @@ try { require("fs").writeSync(2, "[sdk-worker] BOOT pid=" + process.pid + " uid=
 var net = require("net");
 var crypto = require("crypto");
 var path = require("path");
+var fs = require("fs");
 
 var socketPath = process.argv[2];
 if (!socketPath) {
   console.error("[sdk-worker] Missing socket path argument");
   process.exit(1);
+}
+
+// --- Per-user Claude binary resolver ---
+// In OS-level multi-user mode, the worker runs as a different OS user than the
+// Clay daemon. Each user may have their own `claude` install (nvm, asdf,
+// ~/.npm-global, etc.), and the daemon's resolved path may not be executable
+// by the worker user. Resolve from the worker's own environment, falling back
+// to whatever the daemon passed in.
+var _workerClaudeBinary = null;
+var _workerClaudeBinaryResolved = false;
+function resolveWorkerClaudeBinary() {
+  if (_workerClaudeBinaryResolved) return _workerClaudeBinary;
+  _workerClaudeBinaryResolved = true;
+
+  // 1. Explicit env var override
+  if (process.env.CLAUDE_CODE_PATH && fs.existsSync(process.env.CLAUDE_CODE_PATH)) {
+    _workerClaudeBinary = process.env.CLAUDE_CODE_PATH;
+    return _workerClaudeBinary;
+  }
+
+  // 2. `which claude` in the worker user's PATH
+  try {
+    var which = require("child_process").execSync("which claude", { encoding: "utf8", timeout: 5000 }).trim();
+    if (which && fs.existsSync(which)) {
+      _workerClaudeBinary = which;
+      return _workerClaudeBinary;
+    }
+  } catch (e) {}
+
+  // 3. Common per-user and system locations
+  var home = process.env.HOME || "";
+  var candidates = [];
+  if (home) {
+    candidates.push(home + "/.npm-global/bin/claude");
+    candidates.push(home + "/.local/bin/claude");
+    candidates.push(home + "/.volta/bin/claude");
+    candidates.push(home + "/.bun/bin/claude");
+    candidates.push(home + "/bin/claude");
+  }
+  candidates.push("/usr/local/bin/claude");
+  candidates.push("/usr/bin/claude");
+  candidates.push("/opt/homebrew/bin/claude");
+  for (var i = 0; i < candidates.length; i++) {
+    try { if (fs.existsSync(candidates[i])) { _workerClaudeBinary = candidates[i]; return _workerClaudeBinary; } } catch (e) {}
+  }
+
+  // 4. Resolve via require for the bundled CLI entry
+  try {
+    var resolved = require.resolve("@anthropic-ai/claude-code/cli.js");
+    if (resolved && fs.existsSync(resolved)) {
+      _workerClaudeBinary = resolved;
+      return _workerClaudeBinary;
+    }
+  } catch (e) {}
+
+  return null;
+}
+
+function applyWorkerClaudeBinary(options) {
+  if (!options) return options;
+  var workerBinary = resolveWorkerClaudeBinary();
+  if (workerBinary) {
+    // Worker's own resolution wins: per-user environment is authoritative
+    options.pathToClaudeCodeExecutable = workerBinary;
+  }
+  // If worker can't resolve, leave whatever the daemon passed (best-effort fallback)
+  return options;
 }
 
 // --- State ---
@@ -31,6 +99,7 @@ var abortController = null;
 var pendingPermissions = {};  // requestId -> resolve
 var pendingAskUser = {};      // toolUseId -> resolve
 var pendingElicitations = {}; // requestId -> resolve
+var pendingMcpToolCalls = {}; // requestId -> { resolve, reject }
 var conn = null;
 var buffer = "";
 
@@ -81,6 +150,90 @@ function getSDK() {
   return sdkModule;
 }
 
+function buildZodShape(z, inputSchema) {
+  if (!inputSchema || !inputSchema.properties) return {};
+  var shape = {};
+  var props = inputSchema.properties;
+  var required = inputSchema.required || [];
+  var keys = Object.keys(props);
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var prop = props[key];
+    var field;
+
+    if (prop.type === "number" || prop.type === "integer") {
+      field = z.number();
+    } else if (prop.type === "boolean") {
+      field = z.boolean();
+    } else if (prop.type === "array") {
+      field = z.array(z.any());
+    } else if (prop.type === "object") {
+      field = z.record(z.any());
+    } else if (prop.enum) {
+      field = z.enum(prop.enum);
+    } else {
+      field = z.string();
+    }
+
+    if (prop.description) field = field.describe(prop.description);
+    if (required.indexOf(key) === -1) field = field.optional();
+    shape[key] = field;
+  }
+
+  return shape;
+}
+
+function createWorkerMcpToolHandler(serverName, toolName) {
+  return function(args) {
+    var requestId = crypto.randomUUID();
+    sendToDaemon({
+      type: "mcp_tool_call",
+      requestId: requestId,
+      serverName: serverName,
+      toolName: toolName,
+      args: args || {},
+    });
+    return new Promise(function(resolve, reject) {
+      pendingMcpToolCalls[requestId] = { resolve: resolve, reject: reject };
+    });
+  };
+}
+
+function buildMcpServersFromDescriptors(descriptors, sdk) {
+  if (!descriptors || !descriptors.length) return null;
+  var z;
+  try { z = require("zod").z; } catch (e) {
+    try { z = require("zod"); } catch (e2) { return null; }
+  }
+
+  var servers = {};
+  for (var i = 0; i < descriptors.length; i++) {
+    var descriptor = descriptors[i];
+    if (!descriptor || !descriptor.serverName || !descriptor.tools || !descriptor.tools.length) continue;
+    var tools = [];
+    for (var j = 0; j < descriptor.tools.length; j++) {
+      var toolDescriptor = descriptor.tools[j];
+      if (!toolDescriptor || !toolDescriptor.name) continue;
+      tools.push(sdk.tool(
+        toolDescriptor.name,
+        toolDescriptor.description || toolDescriptor.name,
+        buildZodShape(z, toolDescriptor.inputSchema),
+        createWorkerMcpToolHandler(descriptor.serverName, toolDescriptor.name)
+      ));
+    }
+    if (tools.length > 0) {
+      servers[descriptor.serverName] = sdk.createSdkMcpServer({
+        name: descriptor.serverName,
+        version: "1.0.0",
+        tools: tools,
+      });
+    }
+  }
+
+  return Object.keys(servers).length > 0 ? servers : null;
+}
+
 // --- IPC helpers ---
 function sendToDaemon(msg) {
   if (!conn || conn.destroyed) return;
@@ -118,6 +271,9 @@ function handleMessage(msg) {
     case "stop_task":
       handleStopTask(msg);
       break;
+    case "rewind_files":
+      handleRewindFiles(msg);
+      break;
     case "permission_response":
       handlePermissionResponse(msg);
       break;
@@ -126,6 +282,9 @@ function handleMessage(msg) {
       break;
     case "elicitation_response":
       handleElicitationResponse(msg);
+      break;
+    case "mcp_tool_result":
+      handleMcpToolResult(msg);
       break;
     case "warmup":
       handleWarmup(msg);
@@ -208,6 +367,17 @@ function handleElicitationResponse(msg) {
   }
 }
 
+function handleMcpToolResult(msg) {
+  var pending = pendingMcpToolCalls[msg.requestId];
+  if (!pending) return;
+  delete pendingMcpToolCalls[msg.requestId];
+  if (msg.error) {
+    pending.reject(new Error(msg.error));
+    return;
+  }
+  pending.resolve(msg.result);
+}
+
 // --- Query handling ---
 async function handleQueryStart(msg) {
   var t0 = msg._perfT0 || Date.now();
@@ -238,6 +408,16 @@ async function handleQueryStart(msg) {
   options.abortController = abortController;
   options.debug = true;
   options.debugFile = "/tmp/clay-cli-debug-" + process.pid + ".log";
+  applyWorkerClaudeBinary(options);
+  if (options.mcpServerDescriptors && options.mcpServerDescriptors.length) {
+    try {
+      var mcpServers = buildMcpServersFromDescriptors(options.mcpServerDescriptors, sdk);
+      if (mcpServers) options.mcpServers = mcpServers;
+    } catch (e) {
+      console.error("[sdk-worker] Failed to build MCP servers:", e.message || e);
+    }
+    delete options.mcpServerDescriptors;
+  }
   // Override CLI subprocess spawn to inject NODE_OPTIONS for IPv4-first DNS.
   // The SDK constructs its own env for the CLI process, so worker env vars
   // like NODE_OPTIONS are not inherited. We intercept the spawn to fix this.
@@ -247,8 +427,11 @@ async function handleQueryStart(msg) {
     // This is needed because the CLI's Axios-based HTTP client ignores
     // NODE_OPTIONS dns flags and still attempts IPv6 connections via its
     // custom TLS agent, causing 5-10s timeouts on IPv6-less servers.
-    var preloadScript = require("path").join(__dirname, "ipv4-only.js");
-    var extraOpts = " --require " + JSON.stringify(preloadScript);
+    var preloadScript = path.join(__dirname, "..", "..", "ipv4-only.js");
+    var extraOpts = "";
+    if (fs.existsSync(preloadScript)) {
+      extraOpts += " --require " + JSON.stringify(preloadScript);
+    }
     extraOpts += " --dns-result-order=ipv4first --no-network-family-autoselection";
     spawnOpts.env.NODE_OPTIONS = (spawnOpts.env.NODE_OPTIONS || "") + extraOpts;
     console.log("[sdk-worker] spawnClaudeCodeProcess called, command=" + spawnOpts.command);
@@ -418,6 +601,22 @@ async function handleSetPermissionMode(msg) {
   }
 }
 
+async function handleRewindFiles(msg) {
+  // Bridge the host's rewindFiles call to the in-process SDK query inside
+  // the worker. Both the dryRun preview and the actual restore go through
+  // here; the response carries the SDK's preview/result object back.
+  if (!queryInstance || typeof queryInstance.rewindFiles !== "function") {
+    sendToDaemon({ type: "rewind_files_response", requestId: msg.requestId, error: "rewindFiles not supported by active query" });
+    return;
+  }
+  try {
+    var result = await queryInstance.rewindFiles(msg.uuid, msg.opts || {});
+    sendToDaemon({ type: "rewind_files_response", requestId: msg.requestId, result: result });
+  } catch (e) {
+    sendToDaemon({ type: "rewind_files_response", requestId: msg.requestId, error: (e && e.message) ? e.message : String(e) });
+  }
+}
+
 async function handleStopTask(msg) {
   if (!queryInstance) return;
   try {
@@ -448,6 +647,7 @@ async function handleWarmup(msg) {
 
   var warmupOptions = msg.options || {};
   warmupOptions.abortController = ac;
+  applyWorkerClaudeBinary(warmupOptions);
 
   try {
     var stream = sdk.query({

@@ -6,6 +6,9 @@
   "files": [
     "index.js",
     "interface.js",
+    "instructions.js",
+    "mcp-bridge-server.js",
+    "codex-app-server.js",
     "adapters/"
   ],
   "keywords": [
@@ -32,15 +35,33 @@
   "engines": {
     "node": ">=18"
   },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.132",
+    "@anthropic-ai/claude-code": "^2.1.137",
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "peerDependencies": {
+    "@openai/codex": "^0.124.0"
+  },
+  "peerDependenciesMeta": {
+    "@openai/codex": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "semantic-release": "^24.0.0"
   },
   "release": {
-    "branches": ["main"],
+    "branches": [
+      "main"
+    ],
     "plugins": [
-      ["@semantic-release/commit-analyzer", {
-        "preset": "angular"
-      }],
+      [
+        "@semantic-release/commit-analyzer",
+        {
+          "preset": "angular"
+        }
+      ],
       "@semantic-release/release-notes-generator",
       "@semantic-release/npm",
       "@semantic-release/github"
