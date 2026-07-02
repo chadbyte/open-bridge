@@ -1,5 +1,5 @@
 {
-  "name": "@chadbyte/open-bridge",
+  "name": "@open-bridge/core",
   "version": "0.3.0",
   "description": "Open Bridge. Vendor-independent runtime abstraction for AI coding agents.",
   "main": "index.js",

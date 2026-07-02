@@ -32,7 +32,7 @@ carrying a forked copy.
 Standalone (no host integration needed):
 
 ```js
-const { createAdapter, checkAuth } = require('open-bridge');
+const { createAdapter, checkAuth } = require('@open-bridge/core');
 const adapter = createAdapter({ vendor: 'codex', cwd: process.cwd() });
 const q = await adapter.createQuery({ model: 'gpt-5.5', systemPrompt: '…' });
 q.pushMessage('hello');
@@ -44,7 +44,7 @@ open-bridge stays ignorant of OS users — a host that wants process
 isolation puts all of it inside its own `spawnWorker`:
 
 ```js
-const openBridge = require('open-bridge');
+const openBridge = require('@open-bridge/core');
 openBridge.setHostIntegration({
   // open-bridge hands you a neutral launch spec + an opaque context;
   // you decide how the process runs (as another user, sandboxed, …).
