@@ -1,12 +1,13 @@
 {
   "name": "open-bridge",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Open Bridge. Vendor-independent runtime abstraction for AI coding agents.",
   "main": "index.js",
   "files": [
     "index.js",
     "interface.js",
     "instructions.js",
+    "host-integration.js",
     "mcp-bridge-server.js",
     "codex-app-server.js",
     "adapters/"
@@ -41,7 +42,7 @@
     "zod": "^3.25.0 || ^4.0.0"
   },
   "peerDependencies": {
-    "@openai/codex": "^0.124.0"
+    "@openai/codex": "^0.142.4"
   },
   "peerDependenciesMeta": {
     "@openai/codex": {

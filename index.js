@@ -1,12 +1,21 @@
-// Open Bridge — Vendor-independent runtime abstraction for AI coding
-// agents. Public entry point.
+// Open Bridge — Vendor-independent AND host-independent runtime
+// abstraction for AI coding agents. Public entry point.
 //
-// Originally extracted from clay's internal `yoke/` module (Yoke
-// Overrides Known Engines). Some "[YOKE]" log prefixes remain inside
-// adapters; they refer to this module.
+// This is the single source of truth for the Claude/Codex bridge. It is
+// consumed two ways:
+//   - Standalone (e.g. clayOS): plain install, no host integration — the
+//     no-op defaults in host-integration.js apply (no OS-user isolation,
+//     current env, os.homedir()).
+//   - Embedded in a host (clay's multi-user daemon): the host calls
+//     setHostIntegration() once at boot to inject OS-user isolation,
+//     real-home resolution, and local MCP discovery.
+//
+// Some "[YOKE]" log prefixes remain inside adapters (Yoke = the original
+// internal name); they refer to this module.
 
 var iface = require("./interface");
 var instructions = require("./instructions");
+var hostIntegration = require("./host-integration");
 var createClaudeAdapter = require("./adapters/claude").createClaudeAdapter;
 var createCodexAdapter = require("./adapters/codex").createCodexAdapter;
 
@@ -320,4 +329,10 @@ module.exports = {
   TOOL_POLICIES: iface.TOOL_POLICIES,
   validateAdapter: iface.validateAdapter,
   validateQueryHandle: iface.validateQueryHandle,
+  // Host integration seam (see host-integration.js). A host injects
+  // OS-user isolation / real-home / local-MCP here; standalone consumers
+  // never call this and get safe no-op defaults.
+  setHostIntegration: hostIntegration.setHostIntegration,
+  getHostIntegration: hostIntegration.getHostIntegration,
+  resetHostIntegration: hostIntegration.resetHostIntegration,
 };

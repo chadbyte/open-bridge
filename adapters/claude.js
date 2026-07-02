@@ -10,16 +10,13 @@ var os = require("os");
 var net = require("net");
 var crypto = require("crypto");
 var { spawn } = require("child_process");
-/* `../../os-users` is a clay-internal helper for Linux user isolation.
- * Standalone (open-bridge) consumers don't ship it; fall back to a
- * no-op resolver that returns null so the adapter still runs as the
- * current process owner. */
-var resolveOsUserInfo;
-try {
-  resolveOsUserInfo = require("../../os-users").resolveOsUserInfo;
-} catch (e) {
-  resolveOsUserInfo = function () { return null; };
-}
+var { getHostIntegration } = require("../host-integration");
+
+// SDK-specific knowledge stays in the adapter (not the relay): the host dialog
+// kinds this client can render, declared to the SDK when an onUserDialog
+// callback is wired. The CLI fails closed — kinds not listed here are never
+// emitted. Keep in sync with the client's generic user-dialog renderer.
+var SUPPORTED_DIALOG_KINDS = ["refusal_fallback_prompt"];
 
 // --- SDK loading ---
 // Async loader (ESM dynamic import, same pattern as current project.js getSDK)
@@ -191,6 +188,68 @@ function flattenEvent(raw) {
       base.summary = raw.summary || null;
       return base;
     }
+    // Model refusal: the model declined and the CLI either fell back to
+    // another model or ended the turn. Translate to a vendor-neutral
+    // yokeType so the relay never sees SDK subtype strings.
+    if (raw.subtype === "model_refusal_fallback") {
+      base.yokeType = "model_refusal";
+      base.refusalKind = "fallback";
+      base.originalModel = raw.original_model || null;
+      base.fallbackModel = raw.fallback_model || null;
+      base.direction = raw.direction || null;
+      base.category = raw.api_refusal_category || null;
+      return base;
+    }
+    if (raw.subtype === "model_refusal_no_fallback") {
+      base.yokeType = "model_refusal";
+      base.refusalKind = "no_fallback";
+      base.originalModel = raw.original_model || null;
+      base.category = raw.api_refusal_category || null;
+      base.explanation = raw.api_refusal_explanation || null;
+      base.content = raw.content || null;
+      return base;
+    }
+    // Slash-command list changed mid-session (e.g. skills discovered dynamically).
+    if (raw.subtype === "commands_changed") {
+      base.yokeType = "commands_changed";
+      base.commandNames = Array.isArray(raw.commands)
+        ? raw.commands.map(function(c) { return (c && typeof c === "object") ? c.name : c; }).filter(Boolean)
+        : [];
+      return base;
+    }
+    // The session worker is shutting down (reason is a host-set snake_case code).
+    if (raw.subtype === "worker_shutting_down") {
+      base.yokeType = "worker_shutting_down";
+      base.reason = raw.reason || "";
+      return base;
+    }
+    // Live thinking-token estimate (ephemeral progress).
+    if (raw.subtype === "thinking_tokens") {
+      base.yokeType = "thinking_tokens";
+      base.estimatedTokens = raw.estimated_tokens || 0;
+      base.estimatedTokensDelta = raw.estimated_tokens_delta || 0;
+      return base;
+    }
+    // Informational system message (render-leveled: info/notice/suggestion/warning).
+    if (raw.subtype === "informational") {
+      base.yokeType = "informational";
+      base.level = raw.level || "info";
+      base.content = raw.content || "";
+      base.toolUseId = raw.tool_use_id || null;
+      base.preventContinuation = !!raw.prevent_continuation;
+      return base;
+    }
+    // A tool call was denied (by classifier, rule, mode, or async agent).
+    if (raw.subtype === "permission_denied") {
+      base.yokeType = "permission_denied";
+      base.toolName = raw.tool_name || "";
+      base.toolUseId = raw.tool_use_id || null;
+      base.agentId = raw.agent_id || null;
+      base.reasonType = raw.decision_reason_type || null;
+      base.reason = raw.decision_reason || null;
+      base.message = raw.message || "";
+      return base;
+    }
     // Catch-all system event
     base.yokeType = "system";
     base.subtype = raw.subtype;
@@ -347,6 +406,20 @@ function createQueryHandle(rawQuery, messageQueue, abortController) {
       return Promise.resolve();
     },
 
+    reloadSkills: function() {
+      if (rawQuery && typeof rawQuery.reloadSkills === "function") {
+        return rawQuery.reloadSkills();
+      }
+      return Promise.resolve(null);
+    },
+
+    setMcpPermissionModeOverride: function(serverName, mode) {
+      if (rawQuery && typeof rawQuery.setMcpPermissionModeOverride === "function") {
+        return rawQuery.setMcpPermissionModeOverride(serverName, mode);
+      }
+      return Promise.resolve(null);
+    },
+
     getContextUsage: function() {
       if (rawQuery && typeof rawQuery.getContextUsage === "function") {
         return rawQuery.getContextUsage();
@@ -437,17 +510,18 @@ function createQueryHandle(rawQuery, messageQueue, abortController) {
   } catch (e) {}
 })();
 
-// resolveLinuxUser delegates to shared os-users utility
-function resolveLinuxUser(username) {
-  return resolveOsUserInfo(username);
-}
-
 /**
- * Spawn an SDK worker process running as the given Linux user.
+ * Spawn an SDK worker process. HOW the OS process is launched is entirely
+ * the host's business: standalone it's a plain child_process.spawn as the
+ * current user; a host may run it as a different OS user, drop privileges,
+ * build an isolated env, etc. open-bridge hands over a neutral launch spec
+ * (command/args/cwd/stdio + an opaque `context`) and gets back a
+ * ChildProcess — it never learns about uids, groups, or isolation.
+ * `workerUser` is an opaque token supplied by the caller (via
+ * adapterOptions.CLAUDE.linuxUser); open-bridge only passes it through.
  * Returns a worker handle with send/kill/event methods.
  */
-function spawnWorker(linuxUser, workerScriptPath, cwd) {
-  var userInfo = resolveLinuxUser(linuxUser);
+function spawnWorker(workerUser, workerScriptPath, cwd) {
   var socketId = crypto.randomUUID();
   var socketPath = path.join(os.tmpdir(), "clay-worker-" + socketId + ".sock");
 
@@ -513,45 +587,31 @@ function spawnWorker(linuxUser, workerScriptPath, cwd) {
     // Set socket permissions so the target user can connect
     try { fs.chmodSync(socketPath, 0o777); } catch (e) {}
 
-    // Spawn worker process as the target Linux user.
-    // Build a minimal, isolated env (no daemon env leakage).
-    // `../../build-user-env` is clay-internal — open-bridge consumers
-    // that don't ship it never reach this branch (resolveOsUserInfo is
-    // a no-op fallback returning null), but we still try-load defensively.
-    var buildUserEnv;
-    try { buildUserEnv = require("../../build-user-env").buildUserEnv; }
-    catch (e) { throw new Error("Linux-user worker spawn requires clay's build-user-env helper."); }
-    var workerEnv = buildUserEnv({
-      uid: userInfo.uid,
-      gid: userInfo.gid,
-      home: userInfo.home,
-      user: linuxUser,
-      shell: userInfo.shell || "/bin/bash",
-    });
-
-    console.log("[yoke/claude] Spawning worker: uid=" + userInfo.uid + " gid=" + userInfo.gid + " cwd=" + cwd + " socket=" + socketPath);
-    console.log("[yoke/claude] Worker script: " + workerScriptPath);
-    console.log("[yoke/claude] Node: " + process.execPath);
-    worker.process = spawn(process.execPath, [workerScriptPath, socketPath], {
-      uid: userInfo.uid,
-      gid: userInfo.gid,
-      env: workerEnv,
+    // Delegate the actual process launch to the host. The default hook is
+    // a plain spawn as the current user; a multi-user host implements this
+    // to resolve `context.worker` to an OS user, build an isolated env, and
+    // drop privileges — all invisible to open-bridge.
+    console.log("[yoke/claude] Spawning worker: cwd=" + cwd + " socket=" + socketPath + " node=" + process.execPath);
+    worker.process = getHostIntegration().spawnWorker({
+      command: process.execPath,
+      args: [workerScriptPath, socketPath],
       cwd: cwd,
       stdio: ["ignore", "pipe", "pipe"],
+      context: { worker: workerUser },
     });
 
     worker.process.stdout.on("data", function(data) {
-      console.log("[sdk-worker:" + linuxUser + "] " + data.toString().trim());
+      console.log("[sdk-worker:" + workerUser + "] " + data.toString().trim());
     });
     worker._stderrBuf = "";
     worker.process.stderr.on("data", function(data) {
       var text = data.toString().trim();
       worker._stderrBuf += text + "\n";
-      console.error("[sdk-worker:" + linuxUser + "] " + text);
+      console.error("[sdk-worker:" + workerUser + "] " + text);
     });
 
     worker.process.on("exit", function(code, signal) {
-      console.log("[yoke/claude] Worker for " + linuxUser + " exited (code=" + code + ", signal=" + signal + ")" + (worker._stderrBuf ? " stderr: " + worker._stderrBuf.trim() : ""));
+      console.log("[yoke/claude] Worker for " + workerUser + " exited (code=" + code + ", signal=" + signal + ")" + (worker._stderrBuf ? " stderr: " + worker._stderrBuf.trim() : ""));
       // Reject readyPromise if worker dies before becoming ready
       if (!worker.ready && worker._readyResolve) {
         worker._readyResolve = null;
@@ -696,7 +756,7 @@ function serializeWorkerValue(value, seen) {
 // in-process QueryHandle. This allows processQueryStream to iterate a worker
 // query identically to an in-process query.
 
-function createWorkerQueryHandle(worker, canUseTool, onElicitation, callMcpTool) {
+function createWorkerQueryHandle(worker, canUseTool, onElicitation, callMcpTool, onUserDialog) {
   // Async iterable state
   var iterQueue = [];
   var iterWaiting = null;
@@ -791,6 +851,24 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation, callMcpTool)
           }).catch(function(e) {
             console.error("[yoke/claude] elicitation_response send failed:", e.message || e);
           });
+        }
+        break;
+
+      case "user_dialog_request":
+        if (onUserDialog) {
+          onUserDialog({
+            dialogKind: msg.dialogKind,
+            payload: msg.payload || {},
+            toolUseID: msg.toolUseId || undefined,
+          }, {
+            signal: { addEventListener: function() {} },
+          }).then(function(result) {
+            worker.send({ type: "user_dialog_response", requestId: msg.requestId, result: result });
+          }).catch(function(e) {
+            console.error("[yoke/claude] user_dialog_response send failed:", e.message || e);
+          });
+        } else {
+          worker.send({ type: "user_dialog_response", requestId: msg.requestId, result: { behavior: "cancelled" } });
         }
         break;
 
@@ -929,6 +1007,16 @@ function createWorkerQueryHandle(worker, canUseTool, onElicitation, callMcpTool)
     stopTask: function(taskId) {
       worker.send({ type: "stop_task", taskId: taskId });
       return Promise.resolve();
+    },
+
+    reloadSkills: function() {
+      worker.send({ type: "reload_skills" });
+      return Promise.resolve(null);
+    },
+
+    setMcpPermissionModeOverride: function(serverName, mode) {
+      worker.send({ type: "set_mcp_permission_mode_override", serverName: serverName, mode: mode });
+      return Promise.resolve(null);
     },
 
     getContextUsage: function() {
@@ -1094,11 +1182,18 @@ function createClaudeAdapter(opts) {
         },
       };
 
+      // Capture the session_id from the system/init event so we can
+      // delete the SDK-created jsonl file after we abort. The SDK starts
+      // a real CLI session as soon as it receives our dummy "hi" prompt;
+      // without cleanup these one-line ("hi") sessions pile up in the
+      // Resume CLI session list.
+      var warmupSessionId = null;
       try {
         var stream = sdk.query({ prompt: mq, options: warmupOptions });
 
         for await (var msg of stream) {
           if (msg.type === "system" && msg.subtype === "init") {
+            warmupSessionId = msg.session_id || null;
             result.skills = msg.skills || [];
             result.defaultModel = msg.model || "";
             result.slashCommands = msg.slash_commands || [];
@@ -1120,6 +1215,17 @@ function createClaudeAdapter(opts) {
         if (e && e.name !== "AbortError" && !(e.message && e.message.indexOf("aborted") !== -1)) {
           throw e;
         }
+      }
+
+      // Delete the warmup CLI jsonl file. Best-effort: file may not exist
+      // (race conditions, alt SDK behavior, etc.) - silently skip.
+      if (warmupSessionId) {
+        try {
+          var wmCwd = (initOpts && initOpts.cwd) || _cwd;
+          var wmEncoded = wmCwd.replace(/[^a-zA-Z0-9]/g, "-");
+          var wmPath = path.join(os.homedir(), ".claude", "projects", wmEncoded, warmupSessionId + ".jsonl");
+          fs.unlinkSync(wmPath);
+        } catch (e) {}
       }
 
       return result;
@@ -1212,6 +1318,10 @@ function createClaudeAdapter(opts) {
       if (queryOpts.toolServers) sdkOptions.mcpServers = queryOpts.toolServers;
       if (queryOpts.canUseTool) sdkOptions.canUseTool = queryOpts.canUseTool;
       if (queryOpts.onElicitation) sdkOptions.onElicitation = queryOpts.onElicitation;
+      if (queryOpts.onUserDialog) {
+        sdkOptions.onUserDialog = queryOpts.onUserDialog;
+        sdkOptions.supportedDialogKinds = SUPPORTED_DIALOG_KINDS;
+      }
       if (queryOpts.resumeSessionId) sdkOptions.resume = queryOpts.resumeSessionId;
 
       // Claude-specific options from adapterOptions.CLAUDE
@@ -1360,7 +1470,7 @@ function createClaudeAdapter(opts) {
     }
 
     // Create the worker query handle (sets up message handler on worker)
-    var handle = createWorkerQueryHandle(worker, queryOpts.canUseTool, queryOpts.onElicitation, queryOpts.callMcpTool);
+    var handle = createWorkerQueryHandle(worker, queryOpts.canUseTool, queryOpts.onElicitation, queryOpts.callMcpTool, queryOpts.onUserDialog);
 
     // Wait for worker to be ready before sending query_start
     if (!reusingWorker) {
@@ -1387,6 +1497,7 @@ function createClaudeAdapter(opts) {
     if (claudeOpts.settings) queryOptions.settings = claudeOpts.settings;
 
     if (queryOpts.toolServerDescriptors) queryOptions.mcpServerDescriptors = queryOpts.toolServerDescriptors;
+    if (queryOpts.onUserDialog) queryOptions.supportedDialogKinds = SUPPORTED_DIALOG_KINDS;
     if (queryOpts.model) queryOptions.model = queryOpts.model;
     if (queryOpts.effort) queryOptions.effort = queryOpts.effort;
     if (queryOpts.resumeSessionId) queryOptions.resume = queryOpts.resumeSessionId;

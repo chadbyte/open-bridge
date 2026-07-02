@@ -6,14 +6,14 @@
 var path = require("path");
 var fs = require("fs");
 var { CodexAppServer } = require("../codex-app-server");
+var { getHostIntegration } = require("../host-integration");
 
 // --- Claude skill discovery ---
 // Finds Claude skills in ~/.claude/skills/ and <cwd>/.claude/skills/
 // so Codex can recognize $<skill-name> in user input.
 function discoverClaudeSkills(cwd) {
   var skills = {};
-  var REAL_HOME;
-  try { REAL_HOME = require("../../config").REAL_HOME; } catch (e) { REAL_HOME = require("os").homedir(); }
+  var REAL_HOME = getHostIntegration().realHome();
   var dirs = [
     path.join(REAL_HOME, ".claude", "skills"),
     path.join(cwd || "", ".claude", "skills"),
@@ -145,6 +145,16 @@ function normalizePlanStatus(status) {
   return "pending";
 }
 
+// Detect Codex "not logged in" errors. Codex surfaces auth failures several
+// ways depending on transport: a clean error event with
+// codexErrorInfo:"unauthorized", or a turn/failed / item error whose message
+// carries a 401 / token-revoked / missing-bearer / "sign in again" string.
+// Callers map a match to the neutral auth_required yokeType.
+function isCodexAuthError(text, errObj) {
+  if (errObj && errObj.codexErrorInfo === "unauthorized") return true;
+  return /sign in again|token[_ ]?revoked|invalidated oauth|missing bearer|unauthorized|\b401\b/i.test(String(text || ""));
+}
+
 function extractPromptSuggestion(params) {
   if (!params) return "";
   if (typeof params.suggestion === "string") return params.suggestion;
@@ -226,9 +236,14 @@ function flattenEvent(notification, state) {
   }
 
   if (method === "turn/failed") {
+    var tfMsg = params.error ? params.error.message : "Turn failed";
+    if (isCodexAuthError(tfMsg, params.error)) {
+      events.push({ yokeType: "auth_required", vendor: "codex" });
+      return events;
+    }
     events.push({
       yokeType: "error",
-      text: params.error ? params.error.message : "Turn failed",
+      text: tfMsg,
     });
     return events;
   }
@@ -525,9 +540,14 @@ function flattenEvent(notification, state) {
 
     // Error item
     if (item.type === "error") {
+      var ieMsg = item.message || "Unknown error";
+      if (isCodexAuthError(ieMsg, item)) {
+        events.push({ yokeType: "auth_required", vendor: "codex" });
+        return events;
+      }
       events.push({
         yokeType: "error",
-        text: item.message || "Unknown error",
+        text: ieMsg,
       });
       return events;
     }
@@ -548,6 +568,20 @@ function flattenEvent(notification, state) {
       yokeType: "prompt_suggestion",
       suggestion: promptSuggestion,
     });
+    return events;
+  }
+
+  // Top-level error event. Codex signals "not logged in" via an unauthorized /
+  // token-revoked error (not a login-prompt message like Claude), so map it to
+  // the neutral auth_required yokeType to drive the login flow.
+  if (method === "error" && params && params.error) {
+    var cErr = params.error;
+    var cErrMsg = cErr.message || "Codex error";
+    if (isCodexAuthError(cErrMsg, cErr)) {
+      events.push({ yokeType: "auth_required", vendor: "codex" });
+      return events;
+    }
+    events.push({ yokeType: "error", text: cErrMsg });
     return events;
   }
 
@@ -586,7 +620,7 @@ function createCodexQueryHandle(appServer, queryOpts) {
     done: false,
     aborted: false,
     loopStarted: false,
-    model: queryOpts.model || "gpt-5.4",
+    model: queryOpts.model || "gpt-5.5",
     // Track incremental text deltas
     textBlocks: {},     // itemId -> true (text_start sent)
     textLengths: {},    // itemId -> last sent length
@@ -831,7 +865,7 @@ function createCodexQueryHandle(appServer, queryOpts) {
 
       // Start or resume thread
       var threadParams = {
-        model: queryOpts.model || "gpt-5.4",
+        model: queryOpts.model || "gpt-5.5",
         sandbox: queryOpts.sandboxMode || "workspace-write",
         approvalPolicy: queryOpts.approvalPolicy || "on-failure",
         cwd: queryOpts.cwd,
@@ -922,10 +956,10 @@ function createCodexQueryHandle(appServer, queryOpts) {
       if (!isCancelled() && e.name !== "AbortError") {
         console.error("[yoke/codex] runQueryLoop error:", e.message || e);
         console.error("[yoke/codex] stack:", e.stack || "(no stack)");
-        pushEvent({
-          yokeType: "error",
-          text: e.message || String(e),
-        });
+        var loopErrMsg = e.message || String(e);
+        pushEvent(isCodexAuthError(loopErrMsg)
+          ? { yokeType: "auth_required", vendor: "codex" }
+          : { yokeType: "error", text: loopErrMsg });
       }
     }
 
@@ -1047,7 +1081,19 @@ function createCodexAdapter(opts) {
   var _cwd = (opts && opts.cwd) || process.cwd();
   var _slug = (opts && opts.slug) || "";
   var _defaultInitOpts = Object.assign({}, opts || {});
-  var _cachedModels = [];
+  // Codex models are a fixed list (the app-server doesn't enumerate them), so
+  // model listing must not depend on a successful app-server init — otherwise a
+  // slow/failed `initialize` leaves the picker empty and the chip shows the
+  // previous vendor's model.
+  var CODEX_MODELS = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+  ];
+  var _cachedModels = CODEX_MODELS.slice();
   var _appServer = null;
   var _initPromise = null;
   var _shutdownPromise = null;
@@ -1085,7 +1131,7 @@ function createCodexAdapter(opts) {
   function buildReadyResponse(skillNames) {
     return {
       models: _cachedModels,
-      defaultModel: "gpt-5.4",
+      defaultModel: "gpt-5.5",
       skills: skillNames || [],
       slashCommands: skillNames || [],
       fastModeState: null,
@@ -1230,8 +1276,7 @@ function createCodexAdapter(opts) {
         // and inject into Codex config so Codex manages them natively.
         var mcpServerConfig = {};
         try {
-          var mcpLocal = require("../../mcp-local");
-          var localMcpServers = mcpLocal.readMergedServers();
+          var localMcpServers = getHostIntegration().readMergedMcpServers();
           var mcpNames = Object.keys(localMcpServers);
           for (var mi = 0; mi < mcpNames.length; mi++) {
             var ms = localMcpServers[mcpNames[mi]];
@@ -1247,21 +1292,13 @@ function createCodexAdapter(opts) {
         }
 
         // Track 2: Add clay-tools bridge server for in-app + remote MCP tools.
-        // The bridge expects a clay daemon on clayPort. Non-clay consumers
-        // (e.g. pegboard) opt out via { skipClayTools: true } or the env
-        // var OPEN_BRIDGE_SKIP_CLAY_TOOLS=1 — without that the MCP bridge
-        // child blocks codex's turn loop trying to reach a daemon that
-        // doesn't exist.
-        var skipClayTools =
-          effectiveInitOpts.skipClayTools === true ||
-          process.env.OPEN_BRIDGE_SKIP_CLAY_TOOLS === "1";
         var bridgePath = require("path").join(__dirname, "..", "mcp-bridge-server.js");
         var clayPort = effectiveInitOpts.clayPort || process.env.CLAY_PORT || 2633;
         var clayTls = effectiveInitOpts.clayTls || false;
         var clayAuthToken = effectiveInitOpts.clayAuthToken || "";
         var claySlug = effectiveInitOpts.slug || _slug || "";
         try {
-          if (!skipClayTools && require("fs").existsSync(bridgePath)) {
+          if (require("fs").existsSync(bridgePath)) {
             var bridgeArgs = [bridgePath, "--port", String(clayPort), "--slug", claySlug];
             if (clayTls) bridgeArgs.push("--tls");
             var bridgeEnv = {};
@@ -1305,21 +1342,14 @@ function createCodexAdapter(opts) {
           throw createShutdownError();
         }
 
-        console.log("[codex] App-server initialized, models: gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.2");
+        console.log("[codex] App-server initialized, models: " + CODEX_MODELS.join(", "));
 
-        _cachedModels = [
-          "gpt-5.4",
-          "gpt-5.4-mini",
-          "gpt-5.3-codex",
-          "gpt-5.3-codex-spark",
-          "gpt-5.2",
-        ];
+        _cachedModels = CODEX_MODELS.slice();
 
         // Discover skills: built-in Codex skills + Claude skills
         var skillNames = [];
         try {
-          var REAL_HOME;
-          try { REAL_HOME = require("../../config").REAL_HOME; } catch (e) { REAL_HOME = require("os").homedir(); }
+          var REAL_HOME = getHostIntegration().realHome();
           var claudeSkillsDir = require("path").join(REAL_HOME, ".claude", "skills");
           var extraRoots = _cwd ? [{ cwd: _cwd, extraUserRoots: [claudeSkillsDir] }] : [];
           var skillsResult = await _appServer.send("skills/list", {
@@ -1368,7 +1398,8 @@ function createCodexAdapter(opts) {
     },
 
     supportedModels: function() {
-      return Promise.resolve(_cachedModels.slice());
+      // Fixed list; return it without requiring a live app-server init.
+      return Promise.resolve(CODEX_MODELS.slice());
     },
 
     createToolServer: function(def) {
@@ -1395,7 +1426,7 @@ function createCodexAdapter(opts) {
         throw new Error("[yoke/codex] Adapter not initialized. Call init() first.");
       }
 
-      var model = queryOpts.model || "gpt-5.4";
+      var model = queryOpts.model || "gpt-5.5";
       var ac = queryOpts.abortController || new AbortController();
       var activeEntry = {
         abort: function() {
